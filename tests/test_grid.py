@@ -20,6 +20,7 @@ from app.grid import (
     find_sound_conflicts,
     format_rational,
     format_seconds,
+    lead_handoff_preview,
     parse_nonnegative_rational,
     parse_positive_decimal,
     parse_rational,
@@ -948,6 +949,217 @@ class ComputeTimePreviewTest(unittest.TestCase):
         self.assertEqual(format_seconds(bass[1]["start_seconds"]), "0.500000")
         self.assertEqual(format_seconds(bass[1]["end_seconds"]), "2.386294")
         self.assertEqual(format_seconds(result["total_seconds"]), "2.386294")
+
+
+class LeadHandoffPreviewTest(unittest.TestCase):
+    def _leaders(self, result):
+        return [
+            (segment["leader"]["voice"], segment["leader"]["event_id"])
+            if segment["leader"] is not None
+            else None
+            for segment in result["segments"]
+        ]
+
+    def test_grid_segments_are_reused_with_rational_endpoints_and_lex_tie(self):
+        # Same measure as the grid tests: boundaries at 0, 1/4, 1/2,
+        # 3/4, 1. The middle [1/2,3/4) segment is carried by bass alone.
+        # Keeping melody across [0,1/2) and bass from 1/2 on costs one
+        # handoff; switching to bass already at 1/4 costs one too, so the
+        # tie is resolved by the lex smaller sequence (melody at 1/4).
+        voices = make_voices(
+            [
+                (
+                    "melody",
+                    [(KIND_SOUND, "1/2"), (KIND_REST, "1/4"), (KIND_SOUND, "1/4")],
+                ),
+                ("bass", [(KIND_REST, "1/4"), (KIND_SOUND, "3/4")]),
+            ]
+        )
+        result = lead_handoff_preview(voices)
+        self.assertEqual(result["handoffs"], 1)
+        self.assertEqual(
+            [(s["start"], s["end"]) for s in result["segments"]],
+            [
+                (Fraction(0), Fraction(1, 4)),
+                (Fraction(1, 4), Fraction(1, 2)),
+                (Fraction(1, 2), Fraction(3, 4)),
+                (Fraction(3, 4), 1),
+            ],
+        )
+        self.assertEqual(
+            self._leaders(result),
+            [
+                ("melody", "v1e1"),
+                ("melody", "v1e1"),
+                ("bass", "v2e2"),
+                ("bass", "v2e2"),
+            ],
+        )
+
+    def test_all_rest_segment_returns_null_and_breaks_the_relay(self):
+        # bass rests throughout; melody: sound 1/4, rest 1/2, sound 1/4.
+        # Boundaries 0, 1/4, 3/4, 1: the single all-rest middle segment
+        # splits the relay, so carrying on with the same melody afterwards
+        # costs no handoff.
+        voices = make_voices(
+            [
+                ("melody", [
+                    (KIND_SOUND, "1/4"),
+                    (KIND_REST, "1/2"),
+                    (KIND_SOUND, "1/4"),
+                ]),
+                ("bass", [(KIND_REST, "1")]),
+            ]
+        )
+        result = lead_handoff_preview(voices)
+        self.assertEqual(result["handoffs"], 0)
+        self.assertEqual(
+            self._leaders(result),
+            [("melody", "v1e1"), None, ("melody", "v1e3")],
+        )
+        self.assertIsNone(result["segments"][1]["leader"])
+
+    def test_everyone_rests_everywhere(self):
+        voices = make_voices(
+            [
+                ("a", [(KIND_REST, "1/2"), (KIND_REST, "1/2")]),
+                ("b", [(KIND_REST, "1")]),
+            ]
+        )
+        result = lead_handoff_preview(voices)
+        self.assertEqual(result["handoffs"], 0)
+        self.assertEqual(
+            [(s["start"], s["end"]) for s in result["segments"]],
+            [(Fraction(0), Fraction(1, 2)), (Fraction(1, 2), 1)],
+        )
+        self.assertTrue(all(s["leader"] is None for s in result["segments"]))
+
+    def test_zero_handoff_tie_goes_to_the_first_stored_voice(self):
+        # Three voices each hold one sound over the whole measure: every
+        # constant leader sequence costs 0; storage order picks voice a.
+        voices = make_voices(
+            [
+                ("a", [(KIND_SOUND, "1")]),
+                ("b", [(KIND_SOUND, "1")]),
+                ("c", [(KIND_SOUND, "1")]),
+            ]
+        )
+        result = lead_handoff_preview(voices)
+        self.assertEqual(result["handoffs"], 0)
+        self.assertEqual(self._leaders(result), [("a", "v1e1")])
+
+    def test_handoff_is_forced_when_only_one_voice_carries_each_part(self):
+        # a sounds [0, 1/2), b sounds [1/2, 1): disjoint carriers on two
+        # adjacent sounding segments force exactly one handoff.
+        voices = make_voices(
+            [
+                ("a", [(KIND_SOUND, "1/2"), (KIND_REST, "1/2")]),
+                ("b", [(KIND_REST, "1/2"), (KIND_SOUND, "1/2")]),
+            ]
+        )
+        result = lead_handoff_preview(voices)
+        self.assertEqual(result["handoffs"], 1)
+        self.assertEqual(self._leaders(result), [("a", "v1e1"), ("b", "v2e2")])
+
+    def test_minimum_handoffs_beats_a_lexicographically_smaller_sequence(self):
+        # Three adjacent sounding segments with choices {a,b}, {b}, {a,b}:
+        # starting on the lex-smaller voice a forces a handoff into the
+        # b-only middle (and another back), while b leads all three with
+        # zero handoffs — the optimum disregards lex order.
+        voices = make_voices(
+            [
+                ("a", [
+                    (KIND_SOUND, "1/3"),
+                    (KIND_REST, "1/3"),
+                    (KIND_SOUND, "1/3"),
+                ]),
+                ("b", [(KIND_SOUND, "1")]),
+            ]
+        )
+        result = lead_handoff_preview(voices)
+        self.assertEqual(result["handoffs"], 0)
+        self.assertEqual(
+            self._leaders(result),
+            [("b", "v2e1"), ("b", "v2e1"), ("b", "v2e1")],
+        )
+
+    def test_independent_blocks_separated_by_a_rest_each_pick_earliest_voice(self):
+        # Both voices share the pattern sound 1/4, rest 1/2, sound 1/4:
+        # the all-rest middle breaks the relay, and each independent
+        # sounding block is tied 0 handoffs, so storage order picks a
+        # before and after.
+        voices = make_voices(
+            [
+                ("a", [
+                    (KIND_SOUND, "1/4"),
+                    (KIND_REST, "1/2"),
+                    (KIND_SOUND, "1/4"),
+                ]),
+                ("b", [
+                    (KIND_SOUND, "1/4"),
+                    (KIND_REST, "1/2"),
+                    (KIND_SOUND, "1/4"),
+                ]),
+            ]
+        )
+        result = lead_handoff_preview(voices)
+        self.assertEqual(result["handoffs"], 0)
+        self.assertEqual(
+            self._leaders(result),
+            [("a", "v1e1"), None, ("a", "v1e3")],
+        )
+
+    def test_tie_between_two_optimal_continuations_picks_earlier_voice(self):
+        # Three adjacent sounding segments with forced leaders
+        # {a}, {b, c}, {a}: two handoffs are unavoidable, and both
+        # choices in the middle (b or c) cost exactly two; the
+        # lexicographically smaller complete sequence keeps voice b.
+        voices = make_voices(
+            [
+                ("a", [
+                    (KIND_SOUND, "1/3"),
+                    (KIND_REST, "1/3"),
+                    (KIND_SOUND, "1/3"),
+                ]),
+                ("b", [
+                    (KIND_REST, "1/3"),
+                    (KIND_SOUND, "1/3"),
+                    (KIND_REST, "1/3"),
+                ]),
+                ("c", [
+                    (KIND_REST, "1/3"),
+                    (KIND_SOUND, "1/3"),
+                    (KIND_REST, "1/3"),
+                ]),
+            ]
+        )
+        result = lead_handoff_preview(voices)
+        self.assertEqual(result["handoffs"], 2)
+        self.assertEqual(
+            self._leaders(result),
+            [("a", "v1e1"), ("b", "v2e2"), ("a", "v1e3")],
+        )
+
+    def test_event_id_tracks_the_specific_sounding_event_across_a_handoff(self):
+        # a: sound 1/2, sound 1/4, rest 1/4; b: rest 3/4, sound 1/4.
+        # a leads through two of its own events (id changes at 1/2 with
+        # no handoff), then the final segment is carried by b alone.
+        voices = make_voices(
+            [
+                ("a", [
+                    (KIND_SOUND, "1/2"),
+                    (KIND_SOUND, "1/4"),
+                    (KIND_REST, "1/4"),
+                ]),
+                ("b", [(KIND_REST, "3/4"), (KIND_SOUND, "1/4")]),
+            ]
+        )
+        result = lead_handoff_preview(voices)
+        self.assertEqual(result["handoffs"], 1)
+        self.assertEqual(
+            self._leaders(result),
+            [("a", "v1e1"), ("a", "v1e2"), ("b", "v2e2")],
+        )
 
 
 if __name__ == "__main__":

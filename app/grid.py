@@ -146,6 +146,110 @@ def compute_grid(voices: list[dict]) -> list[dict]:
     return segments
 
 
+def lead_handoff_preview(voices: list[dict]) -> dict:
+    """Assign one leading voice per grid segment, minimizing handoffs.
+
+    The half-open segments reuse :func:`compute_grid` (the union of
+    every voice's event boundaries). A segment in which at least one
+    voice sounds must be led by exactly one of those voices; a segment
+    in which every voice rests has no leader (``None``) and breaks the
+    relay, so neither entering nor leaving such a segment counts as a
+    handoff. A change of leader between two adjacent sounding segments
+    counts as one handoff; leaders separated by an all-rest segment
+    never do.
+
+    Over the whole measure the total handoff count is minimized. Ties
+    are broken by the lexicographically smallest complete leader
+    sequence compared in voice storage order; all-rest positions hold
+    ``None`` in every feasible sequence and so never decide a tie.
+
+    A suffix dynamic program over (segment, chosen leader) states gives
+    the minimum remaining handoffs; ties are then reconstructed
+    greedily by always taking the earliest-stored feasible voice, which
+    yields the lexicographically smallest optimal sequence.
+
+    ``voices`` items are {"name": str, "events": [built events]}.
+    Returns ``{"segments": [{"start", "end", "leader": {"voice",
+    "event_id"} | None}], "handoffs": int}`` with Fraction endpoints.
+    """
+    grid_segments = compute_grid(voices)
+    names = [voice["name"] for voice in voices]
+
+    # Candidate leaders per segment: stored-order indices of the voices
+    # sounding throughout it; an empty list means every voice rests.
+    choices: list[list[int]] = [
+        [
+            index
+            for index, name in enumerate(names)
+            if segment["events"][name] is not None
+        ]
+        for segment in grid_segments
+    ]
+
+    def states(index: int) -> list[int | None]:
+        # An all-rest segment has the single forced state None.
+        return list(choices[index]) if choices[index] else [None]
+
+    def transition(previous: int | None, current: int | None) -> int:
+        # Only two adjacent sounding segments with different leaders
+        # exchange the lead; a None on either side is a broken relay.
+        return (
+            1
+            if previous is not None
+            and current is not None
+            and previous != current
+            else 0
+        )
+
+    count = len(grid_segments)
+    assert count >= 1  # Positive target and durations always bound one segment.
+
+    # rows[i][state] = minimum handoffs on segments i..count-1 given
+    # segment i takes this leader state.
+    rows: list[dict[int | None, int]] = [{} for _ in range(count)]
+    rows[count - 1] = {state: 0 for state in states(count - 1)}
+    for index in range(count - 2, -1, -1):
+        next_row = rows[index + 1]
+        for state in states(index):
+            rows[index][state] = min(
+                transition(state, following) + next_row[following]
+                for following in states(index + 1)
+            )
+
+    first_row = rows[0]
+    # A segment's states are either all voice indices or the single
+    # None, so plain min is always defined (None and an index never
+    # compete in the same segment).
+    optimal = min(first_row.values())
+    chosen: int | None = min(
+        state for state in states(0) if first_row[state] == optimal
+    )
+    leaders: list[int | None] = [chosen]
+    for index in range(1, count):
+        previous = leaders[-1]
+        chosen = min(
+            state
+            for state in states(index)
+            if transition(previous, state) + rows[index][state]
+            == rows[index - 1][previous]
+        )
+        leaders.append(chosen)
+
+    segments = []
+    for segment, leader_index in zip(grid_segments, leaders):
+        leader = None
+        if leader_index is not None:
+            voice_name = names[leader_index]
+            leader = {
+                "voice": voice_name,
+                "event_id": segment["events"][voice_name],
+            }
+        segments.append(
+            {"start": segment["start"], "end": segment["end"], "leader": leader}
+        )
+    return {"segments": segments, "handoffs": optimal}
+
+
 def find_rhythm_match(
     source_events: list[dict], candidate_events: list[dict]
 ) -> dict | None:

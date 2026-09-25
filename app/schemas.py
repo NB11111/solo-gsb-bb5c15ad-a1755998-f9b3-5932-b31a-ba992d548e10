@@ -98,6 +98,30 @@ class GridOut(BaseModel):
     segments: list[SegmentOut]
 
 
+class HandoffLeaderOut(BaseModel):
+    """The voice leading one grid segment, with its sounding event id."""
+
+    voice: str
+    event_id: str
+
+
+class HandoffSegmentOut(BaseModel):
+    """Half-open grid segment [start, end); null means every voice rests."""
+
+    start: str
+    end: str
+    leader: HandoffLeaderOut | None
+
+
+class LeadHandoffPreviewOut(BaseModel):
+    measure_id: int
+    target_duration: str
+    # Number of adjacent sounding-segment pairs whose leader changes;
+    # crossings over all-rest segments never count.
+    handoffs: int
+    segments: list[HandoffSegmentOut]
+
+
 class RhythmMatchOut(BaseModel):
     """One other voice rhythm-equivalent to the queried voice.
 

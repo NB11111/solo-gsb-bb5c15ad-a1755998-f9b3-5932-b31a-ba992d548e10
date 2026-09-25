@@ -155,6 +155,143 @@ def test_unknown_measure_returns_404():
     assert client.get("/measures/999999/grid").status_code == 404
 
 
+# --- POST /measures/{id}/lead-handoff-preview ------------------------------
+
+def test_lead_handoff_preview_minimizes_handoffs_with_lex_tiebreak():
+    # VALID_PAYLOAD: grid at 0, 1/4, 1/2, 3/4, 1.
+    #   [0,1/4):   melody only -> melody
+    #   [1/4,1/2): melody + bass -> tied at one handoff total either way,
+    #              lex smaller keeps melody (stored first)
+    #   [1/2,3/4): bass only -> bass
+    #   [3/4,1):   melody + bass -> staying with bass adds no change
+    # Exactly one handoff, at 1/2.
+    measure_id = client.post("/measures", json=VALID_PAYLOAD).json()["id"]
+    response = client.post(f"/measures/{measure_id}/lead-handoff-preview")
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["measure_id"] == measure_id
+    assert body["target_duration"] == "1"
+    assert body["handoffs"] == 1
+    assert [(s["start"], s["end"], s["leader"]) for s in body["segments"]] == [
+        ("0", "1/4", {"voice": "melody", "event_id": "v1e1"}),
+        ("1/4", "1/2", {"voice": "melody", "event_id": "v1e1"}),
+        ("1/2", "3/4", {"voice": "bass", "event_id": "v2e2"}),
+        ("3/4", "1", {"voice": "bass", "event_id": "v2e2"}),
+    ]
+
+
+def test_lead_handoff_preview_all_rest_segments_are_null_and_break_relay():
+    # melody: sound 1/4, rest 1/2, sound 1/4; bass rests the whole way.
+    # Boundaries 0, 1/4, 3/4, 1: the middle all-rest segment is null and
+    # the relay restarts afterwards, so no handoff is counted.
+    payload = {
+        "target_duration": "1",
+        "voices": [
+            {"name": "melody", "events": [
+                {"kind": "sound", "duration": "1/4"},
+                {"kind": "rest", "duration": "1/2"},
+                {"kind": "sound", "duration": "1/4"},
+            ]},
+            {"name": "bass", "events": [{"kind": "rest", "duration": "1"}]},
+        ],
+    }
+    measure_id = client.post("/measures", json=payload).json()["id"]
+    response = client.post(f"/measures/{measure_id}/lead-handoff-preview")
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["handoffs"] == 0
+    assert [(s["start"], s["end"], s["leader"]) for s in body["segments"]] == [
+        ("0", "1/4", {"voice": "melody", "event_id": "v1e1"}),
+        ("1/4", "3/4", None),
+        ("3/4", "1", {"voice": "melody", "event_id": "v1e3"}),
+    ]
+
+
+def test_lead_handoff_preview_zero_cost_choices_prefer_stored_voice_order():
+    # Three voices sound continuously: any constant leader costs zero
+    # handoffs; the lexicographically smallest sequence is the first
+    # stored voice throughout.
+    payload = {
+        "target_duration": "1",
+        "voices": [
+            {"name": "a", "events": [
+                {"kind": "sound", "duration": "1/2"},
+                {"kind": "sound", "duration": "1/2"},
+            ]},
+            {"name": "b", "events": [{"kind": "sound", "duration": "1"}]},
+            {"name": "c", "events": [{"kind": "sound", "duration": "1"}]},
+        ],
+    }
+    measure_id = client.post("/measures", json=payload).json()["id"]
+    body = client.post(f"/measures/{measure_id}/lead-handoff-preview").json()
+    assert body["handoffs"] == 0
+    assert [(s["leader"]["voice"], s["leader"]["event_id"]) for s in body["segments"]] == [
+        ("a", "v1e1"),
+        ("a", "v1e2"),
+    ]
+
+
+def test_lead_handoff_preview_minimum_beats_lexicographic_preference():
+    # a sounds the outer thirds and rests the middle; b sounds all three
+    # thirds. Leading with b everywhere costs 0; starting on a (lex
+    # smaller) would force two handoffs.
+    payload = {
+        "target_duration": "1",
+        "voices": [
+            {"name": "a", "events": [
+                {"kind": "sound", "duration": "1/3"},
+                {"kind": "rest", "duration": "1/3"},
+                {"kind": "sound", "duration": "1/3"},
+            ]},
+            {"name": "b", "events": [{"kind": "sound", "duration": "1"}]},
+        ],
+    }
+    measure_id = client.post("/measures", json=payload).json()["id"]
+    body = client.post(f"/measures/{measure_id}/lead-handoff-preview").json()
+    assert body["handoffs"] == 0
+    assert [s["leader"] for s in body["segments"]] == [
+        {"voice": "b", "event_id": "v2e1"},
+        {"voice": "b", "event_id": "v2e1"},
+        {"voice": "b", "event_id": "v2e1"},
+    ]
+
+
+def test_lead_handoff_preview_tracks_event_id_and_is_read_only():
+    # a: sound 1/2, sound 1/4, rest 1/4; b: rest 3/4, sound 1/4.
+    # a leads with its event id changing at 1/2 (no handoff), then b.
+    payload = {
+        "target_duration": "1",
+        "voices": [
+            {"name": "a", "events": [
+                {"kind": "sound", "duration": "1/2"},
+                {"kind": "sound", "duration": "1/4"},
+                {"kind": "rest", "duration": "1/4"},
+            ]},
+            {"name": "b", "events": [
+                {"kind": "rest", "duration": "3/4"},
+                {"kind": "sound", "duration": "1/4"},
+            ]},
+        ],
+    }
+    measure_id = client.post("/measures", json=payload).json()["id"]
+    before = client.get(f"/measures/{measure_id}").json()
+    response = client.post(f"/measures/{measure_id}/lead-handoff-preview")
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["handoffs"] == 1
+    assert [(s["leader"]["voice"], s["leader"]["event_id"]) for s in body["segments"]] == [
+        ("a", "v1e1"),
+        ("a", "v1e2"),
+        ("b", "v2e2"),
+    ]
+    # The preview is read-only: the stored measure is unchanged.
+    assert client.get(f"/measures/{measure_id}").json() == before
+
+
+def test_lead_handoff_preview_404_for_missing_measure():
+    assert client.post("/measures/999999/lead-handoff-preview").status_code == 404
+
+
 # --- POST /measures/{id}/quantization-preview ------------------------------
 
 # Melody edges at 0, 1/2, 3/4, 1 and bass edges at 0, 1/4, 1.

@@ -7,6 +7,15 @@ with its difference and nothing is saved. Valid measures are stored in
 SQLite and their beat grid — half-open segments over the union of all
 event boundaries — can be queried by id.
 
+A saved measure's per-segment lead handoff can also be previewed
+(POST /measures/{id}/lead-handoff-preview): each grid segment is led
+by one of the voices sounding throughout it (all-rest segments have
+no leader and break the relay); the service minimizes the number of
+leader changes between adjacent sounding segments, ties resolved by
+the lexicographically smallest leader sequence in voice storage
+order. The result is a preview only; nothing is written back to
+SQLite.
+
 Two saved measures can also be looped together (POST /loop-alignments):
 the service computes the first instant both loops restart together and
 returns the repeated timeline cut at every event boundary, tagged with
@@ -66,6 +75,7 @@ from .grid import (
     find_rhythm_match,
     format_rational,
     format_seconds,
+    lead_handoff_preview,
     parse_nonnegative_rational,
     parse_rational,
     quantize_measure,
@@ -75,6 +85,7 @@ from .schemas import (
     AvoidancePreviewIn,
     AvoidancePreviewOut,
     GridOut,
+    LeadHandoffPreviewOut,
     LoopAlignmentIn,
     LoopAlignmentOut,
     MeasureIn,
@@ -112,6 +123,7 @@ def root() -> dict:
             "create_measure": "POST /measures",
             "get_measure": "GET /measures/{id}",
             "get_grid": "GET /measures/{id}/grid",
+            "lead_handoff_preview": "POST /measures/{id}/lead-handoff-preview",
             "quantization_preview": "POST /measures/{id}/quantization-preview",
             "rhythm_matches": "GET /measures/{id}/rhythm-matches?voice={name}",
             "loop_alignments": "POST /loop-alignments",
@@ -209,6 +221,35 @@ def get_grid(measure_id: int) -> dict:
                 "events": segment["events"],
             }
             for segment in segments
+        ],
+    }
+
+
+@app.post(
+    "/measures/{measure_id}/lead-handoff-preview",
+    response_model=LeadHandoffPreviewOut,
+)
+def lead_handoff_preview_route(measure_id: int) -> dict:
+    # Read-only: the union-of-boundaries grid and the minimum-handoff
+    # leader sequence are computed in exact fractions, but SQLite is
+    # never written back to.
+    measure = db.load_measure(measure_id)
+    if measure is None:
+        raise HTTPException(status_code=404, detail="measure not found")
+
+    _, voices = _fraction_voices(measure)
+    result = lead_handoff_preview(voices)
+    return {
+        "measure_id": measure["id"],
+        "target_duration": measure["target_duration"],
+        "handoffs": result["handoffs"],
+        "segments": [
+            {
+                "start": format_rational(segment["start"]),
+                "end": format_rational(segment["end"]),
+                "leader": segment["leader"],
+            }
+            for segment in result["segments"]
         ],
     }
 
