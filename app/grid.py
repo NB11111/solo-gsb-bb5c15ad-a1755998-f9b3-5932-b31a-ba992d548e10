@@ -146,6 +146,133 @@ def compute_grid(voices: list[dict]) -> list[dict]:
     return segments
 
 
+# Choice marking a grid segment on which every voice rests: the relay has
+# no leader there and is broken, so the next sounding segment starts fresh.
+REST_LEADER = -1
+
+
+def _handoff_edge(current: int, following: int) -> int:
+    """Cost of the relay crossing one adjacent segment pair.
+
+    A fully resting segment on either side breaks the relay, so the edge
+    is free; two adjacent sounding segments charge exactly one handoff
+    when their leaders differ and nothing when the same voice continues.
+    """
+    if current == REST_LEADER or following == REST_LEADER:
+        return 0
+    return 0 if current == following else 1
+
+
+def lead_handoff_preview(voices: list[dict]) -> dict:
+    """Pick one leading voice per grid segment, minimizing handoffs.
+
+    The half-open grid is exactly ``compute_grid`` over the union of all
+    event boundaries. Every segment on which at least one voice sounds
+    must be led by one of the voices sounding on it; a segment on which
+    every voice rests gets the forced REST_LEADER (null in the response)
+    and breaks the relay, so the first sounding segment after it starts
+    a new relay and a different leader there costs nothing.
+
+    The leaders minimize the total number of handoffs (leader changes
+    between adjacent sounding segments). Ties are broken by the
+    lexicographically smallest complete leader sequence, comparing
+    voices by their stored order; rest positions hold the same forced
+    null in every solution and therefore never decide a tie.
+
+    ``voices`` items are {"name": str, "events": [built events]}. Returns
+    {"segments": [{"start", "end", "leader", "event_id"}],
+    "handoff_count": int} with Fraction bounds; leader/event_id are None
+    on fully resting segments.
+
+    Optimization: a dynamic program over (segment, chosen leader) run
+    backwards. tail[i][j] is the minimum edge cost from segment i to the
+    end given segment i takes its j-th feasible choice. Reconstruction
+    then walks forward and always takes the smallest stored-order voice
+    that can still reach the global optimum, which yields the
+    lexicographically smallest optimal sequence.
+    """
+    grid = compute_grid(voices)
+    names = [voice["name"] for voice in voices]
+
+    # Feasible choices per segment in ascending order: the stored voice
+    # indices that sound there, or the single REST_LEADER when none do.
+    options: list[list[int]] = []
+    for segment in grid:
+        sounding = [
+            index
+            for index, name in enumerate(names)
+            if segment["events"][name] is not None
+        ]
+        options.append(sounding if sounding else [REST_LEADER])
+
+    count = len(grid)
+    # tail[i][j] = minimum cost of the edges from segment i onward given
+    # options[i][j] is chosen there; the final segment has no outgoing edge.
+    tail: list[list[int]] = [[0] * len(choices) for choices in options]
+    for index in range(count - 2, -1, -1):
+        following_tail = tail[index + 1]
+        following_options = options[index + 1]
+        for choice_position, current in enumerate(options[index]):
+            best: int | None = None
+            for next_position, following in enumerate(following_options):
+                value = (
+                    _handoff_edge(current, following)
+                    + following_tail[next_position]
+                )
+                if best is None or value < best:
+                    best = value
+            tail[index][choice_position] = best
+
+    # A measure always spans a positive duration, so the grid is non-empty.
+    optimum = min(tail[0])
+
+    # Forward greedy reconstruction: at each segment take the first
+    # choice (smallest stored voice index; the REST_LEADER is forced) that
+    # can still complete a globally optimal relay.
+    chosen: list[int] = []
+    spent = 0
+    for index in range(count):
+        candidates = options[index]
+        if index == 0:
+            choice_position = next(
+                position
+                for position, cost in enumerate(tail[index])
+                if cost == optimum
+            )
+        else:
+            previous = chosen[-1]
+            choice_position = next(
+                position
+                for position, candidate in enumerate(candidates)
+                if spent
+                + _handoff_edge(previous, candidate)
+                + tail[index][position]
+                == optimum
+            )
+        if index > 0:
+            spent += _handoff_edge(previous, candidates[choice_position])
+        chosen.append(candidates[choice_position])
+
+    segments = []
+    for segment, choice in zip(grid, chosen):
+        if choice == REST_LEADER:
+            leader: str | None = None
+            event_id: str | None = None
+        else:
+            leader = names[choice]
+            event_id = segment["events"][leader]
+        segments.append(
+            {
+                "start": segment["start"],
+                "end": segment["end"],
+                "leader": leader,
+                "event_id": event_id,
+            }
+        )
+
+    return {"segments": segments, "handoff_count": optimum}
+
+
 def find_rhythm_match(
     source_events: list[dict], candidate_events: list[dict]
 ) -> dict | None:

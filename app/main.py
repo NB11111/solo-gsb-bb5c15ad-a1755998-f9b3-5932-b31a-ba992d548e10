@@ -42,6 +42,16 @@ integrated to seconds from the measure start (whole note = 1); each
 distinct offset is converted once and the same value reused. Results
 carry six decimal places. It is a preview only; nothing is written
 back to SQLite.
+
+A saved measure can finally be previewed as a lead relay
+(POST /measures/{id}/lead-handoff-preview): on the same half-open grid
+of the union of event boundaries, each sounding segment is led by one
+of the voices sounding on it, while fully resting segments return null
+and break the relay. Leaders are chosen to minimize the total number
+of handoffs (leader changes between adjacent sounding segments; a
+change across rest never counts); ties are broken by the
+lexicographically smallest leader sequence in stored voice order. It
+is a read-only preview; nothing is written back to SQLite.
 """
 
 from __future__ import annotations
@@ -66,6 +76,7 @@ from .grid import (
     find_rhythm_match,
     format_rational,
     format_seconds,
+    lead_handoff_preview,
     parse_nonnegative_rational,
     parse_rational,
     quantize_measure,
@@ -75,6 +86,7 @@ from .schemas import (
     AvoidancePreviewIn,
     AvoidancePreviewOut,
     GridOut,
+    LeadHandoffPreviewOut,
     LoopAlignmentIn,
     LoopAlignmentOut,
     MeasureIn,
@@ -117,6 +129,7 @@ def root() -> dict:
             "loop_alignments": "POST /loop-alignments",
             "avoidance_preview": "POST /measures/{id}/avoidance-preview",
             "time_preview": "POST /measures/{id}/time-preview",
+            "lead_handoff_preview": "POST /measures/{id}/lead-handoff-preview",
         },
     }
 
@@ -512,5 +525,35 @@ def time_preview(measure_id: int, payload: TimePreviewIn) -> dict:
                 ],
             }
             for voice in result["voices"]
+        ],
+    }
+
+
+@app.post(
+    "/measures/{measure_id}/lead-handoff-preview",
+    response_model=LeadHandoffPreviewOut,
+)
+def lead_handoff_preview_route(measure_id: int) -> dict:
+    # Read-only: the grid and the minimum-handoff leader sequence are
+    # computed in exact fractions, but SQLite is never written to.
+    measure = db.load_measure(measure_id)
+    if measure is None:
+        raise HTTPException(status_code=404, detail="measure not found")
+
+    _, voices = _fraction_voices(measure)
+    result = lead_handoff_preview(voices)
+    return {
+        "measure_id": measure["id"],
+        "target_duration": measure["target_duration"],
+        "voices": [voice["name"] for voice in voices],
+        "handoff_count": result["handoff_count"],
+        "segments": [
+            {
+                "start": format_rational(segment["start"]),
+                "end": format_rational(segment["end"]),
+                "leader": segment["leader"],
+                "event_id": segment["event_id"],
+            }
+            for segment in result["segments"]
         ],
     }

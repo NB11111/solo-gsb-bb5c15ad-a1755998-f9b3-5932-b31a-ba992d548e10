@@ -928,3 +928,96 @@ def test_time_preview_validates_payload():
         f"/measures/{measure_id}/time-preview",
         json={"segments": [{"end": "1", "start_bpm": "120"}]},
     ).status_code == 422
+
+
+# --- POST /measures/{id}/lead-handoff-preview ------------------------------
+
+def test_lead_handoff_preview_picks_leaders_and_minimizes_handoffs():
+    measure_id = client.post("/measures", json=VALID_PAYLOAD).json()["id"]
+    response = client.post(f"/measures/{measure_id}/lead-handoff-preview")
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["measure_id"] == measure_id
+    assert body["target_duration"] == "1"
+    assert body["voices"] == ["melody", "bass"]
+
+    # Grid {melody}, {melody,bass}, {bass}, {melody,bass}: one handoff.
+    assert body["handoff_count"] == 1
+    assert body["segments"] == [
+        {"start": "0", "end": "1/4", "leader": "melody", "event_id": "v1e1"},
+        {"start": "1/4", "end": "1/2", "leader": "melody", "event_id": "v1e1"},
+        {"start": "1/2", "end": "3/4", "leader": "bass", "event_id": "v2e2"},
+        {"start": "3/4", "end": "1", "leader": "bass", "event_id": "v2e2"},
+    ]
+    # Half-open grid bounds tile the target duration.
+    assert body["segments"][0]["start"] == "0"
+    assert body["segments"][-1]["end"] == body["target_duration"]
+
+
+def test_lead_handoff_preview_rest_segment_is_null_and_breaks_relay():
+    # a sounds the first third, b sounds the last third; the middle
+    # third is a full rest segment.
+    payload = {
+        "target_duration": "1",
+        "voices": [
+            {"name": "a", "events": [
+                {"kind": "sound", "duration": "1/3"},
+                {"kind": "rest", "duration": "2/3"},
+            ]},
+            {"name": "b", "events": [
+                {"kind": "rest", "duration": "2/3"},
+                {"kind": "sound", "duration": "1/3"},
+            ]},
+        ],
+    }
+    measure_id = client.post("/measures", json=payload).json()["id"]
+    response = client.post(f"/measures/{measure_id}/lead-handoff-preview")
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["handoff_count"] == 0
+    assert body["segments"] == [
+        {"start": "0", "end": "1/3", "leader": "a", "event_id": "v1e1"},
+        {"start": "1/3", "end": "2/3", "leader": None, "event_id": None},
+        {"start": "2/3", "end": "1", "leader": "b", "event_id": "v2e2"},
+    ]
+
+
+def test_lead_handoff_preview_ties_break_by_stored_voice_order():
+    # Two voices cover the whole measure (one of them split at 1/4), so
+    # either can lead both segments with zero handoffs; the voice stored
+    # first ("a") wins the lexicographic tie on the full sequence.
+    payload = {
+        "target_duration": "1",
+        "voices": [
+            {"name": "a", "events": [
+                {"kind": "sound", "duration": "1/4"},
+                {"kind": "sound", "duration": "3/4"},
+            ]},
+            {"name": "b", "events": [
+                {"kind": "sound", "duration": "1"},
+            ]},
+        ],
+    }
+    measure_id = client.post("/measures", json=payload).json()["id"]
+    response = client.post(f"/measures/{measure_id}/lead-handoff-preview")
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["handoff_count"] == 0
+    assert [(s["leader"], s["event_id"]) for s in body["segments"]] == [
+        ("a", "v1e1"),
+        ("a", "v1e2"),
+    ]
+
+
+def test_lead_handoff_preview_is_read_only():
+    measure_id = client.post("/measures", json=VALID_PAYLOAD).json()["id"]
+    before = client.get(f"/measures/{measure_id}").json()
+    response = client.post(f"/measures/{measure_id}/lead-handoff-preview")
+    assert response.status_code == 200
+    assert client.get(f"/measures/{measure_id}").json() == before
+
+
+def test_lead_handoff_preview_404_for_missing_measure():
+    response = client.post("/measures/999999/lead-handoff-preview")
+    assert response.status_code == 404
+    assert response.json() == {"detail": "measure not found"}

@@ -20,6 +20,7 @@ from app.grid import (
     find_sound_conflicts,
     format_rational,
     format_seconds,
+    lead_handoff_preview,
     parse_nonnegative_rational,
     parse_positive_decimal,
     parse_rational,
@@ -716,6 +717,176 @@ class AvoidanceMutingTest(unittest.TestCase):
                 or ("b", conflict["b"]["id"]) in muted
             )
             self.assertTrue(covered)
+
+
+class LeadHandoffPreviewTest(unittest.TestCase):
+    def leaders(self, result):
+        return [segment["leader"] for segment in result["segments"]]
+
+    def test_every_sounding_segment_is_led_by_a_sounding_voice(self):
+        # Grid of VALID_PAYLOAD: {melody}, {melody,bass}, {bass},
+        # {melody,bass}.
+        voices = make_voices(
+            [
+                ("melody", [
+                    (KIND_SOUND, "1/2"), (KIND_REST, "1/4"), (KIND_SOUND, "1/4"),
+                ]),
+                ("bass", [(KIND_REST, "1/4"), (KIND_SOUND, "3/4")]),
+            ]
+        )
+        result = lead_handoff_preview(voices)
+        grid = compute_grid(voices)
+        for segment, grid_segment in zip(result["segments"], grid):
+            active = {
+                name
+                for name, event_id in grid_segment["events"].items()
+                if event_id is not None
+            }
+            if active:
+                self.assertIn(segment["leader"], active)
+                self.assertIsNotNone(segment["event_id"])
+            else:
+                self.assertIsNone(segment["leader"])
+                self.assertIsNone(segment["event_id"])
+            # The segment reuses the exact grid bounds.
+            self.assertEqual(segment["start"], grid_segment["start"])
+            self.assertEqual(segment["end"], grid_segment["end"])
+
+    def test_minimizes_handoffs_over_the_whole_measure(self):
+        # Keeping melody over segments 1-2 and bass over 3-4 costs one
+        # handoff (melody -> bass at the middle rest boundary is not a
+        # relay break: segment 2 has bass, segment 3 has bass... the
+        # single change is at segment 2 -> 3).
+        voices = make_voices(
+            [
+                ("melody", [
+                    (KIND_SOUND, "1/2"), (KIND_REST, "1/4"), (KIND_SOUND, "1/4"),
+                ]),
+                ("bass", [(KIND_REST, "1/4"), (KIND_SOUND, "3/4")]),
+            ]
+        )
+        result = lead_handoff_preview(voices)
+        self.assertEqual(self.leaders(result), ["melody", "melody", "bass", "bass"])
+        self.assertEqual(result["handoff_count"], 1)
+        ids = [segment["event_id"] for segment in result["segments"]]
+        self.assertEqual(ids, ["v1e1", "v1e1", "v2e2", "v2e2"])
+
+    def test_rest_segment_returns_null_and_breaks_the_relay(self):
+        # a sounds segment 1, everyone rests segment 2, b sounds
+        # segment 3. The middle rest breaks the relay, so b taking over
+        # after it does not count: zero handoffs.
+        voices = make_voices(
+            [
+                ("a", [(KIND_SOUND, "1/3"), (KIND_REST, "2/3")]),
+                ("b", [(KIND_REST, "1/3"), (KIND_REST, "1/3"),
+                       (KIND_SOUND, "1/3")]),
+            ]
+        )
+        result = lead_handoff_preview(voices)
+        self.assertEqual(self.leaders(result), ["a", None, "b"])
+        self.assertEqual(result["handoff_count"], 0)
+        self.assertIsNone(result["segments"][1]["event_id"])
+
+    def test_change_across_rest_never_counts_but_adjacent_change_does(self):
+        # Three sounds with one shared edge:
+        #   a: sound [0, 1/2), rest to 1
+        #   b: rest [0, 1/2), sound [1/2, 1)
+        # The two sounding segments are adjacent (no rest segment between
+        # them), so the forced different leaders cost exactly one handoff.
+        voices = make_voices(
+            [
+                ("a", [(KIND_SOUND, "1/2"), (KIND_REST, "1/2")]),
+                ("b", [(KIND_REST, "1/2"), (KIND_SOUND, "1/2")]),
+            ]
+        )
+        result = lead_handoff_preview(voices)
+        self.assertEqual(self.leaders(result), ["a", "b"])
+        self.assertEqual(result["handoff_count"], 1)
+
+    def test_ties_break_by_stored_order_full_sequence(self):
+        # a splits its sound at 1/4; b sounds through the whole measure.
+        # Both segments can take either leader: (a,a) and (b,b) both have
+        # zero handoffs, so the lexicographically smallest full sequence
+        # (a first in stored order) wins on the first segment.
+        voices = make_voices(
+            [
+                ("a", [(KIND_SOUND, "1/4"), (KIND_SOUND, "3/4")]),
+                ("b", [(KIND_SOUND, "1")]),
+            ]
+        )
+        result = lead_handoff_preview(voices)
+        self.assertEqual(self.leaders(result), ["a", "a"])
+        self.assertEqual(result["handoff_count"], 0)
+
+    def test_lexicographic_choice_is_global_not_segment_local(self):
+        # Grid {a,b}, {a,c}, {c}. Relays a,a,c and b,c,c each cost one
+        # handoff; a segment-local tie on segment 1 must pick a so the
+        # global lexicographically smallest sequence a,a,c results.
+        voices = make_voices(
+            [
+                ("a", [
+                    (KIND_SOUND, "1/3"), (KIND_SOUND, "1/3"), (KIND_REST, "1/3"),
+                ]),
+                ("b", [(KIND_SOUND, "1/3"), (KIND_REST, "2/3")]),
+                ("c", [
+                    (KIND_REST, "1/3"), (KIND_SOUND, "1/3"), (KIND_SOUND, "1/3"),
+                ]),
+            ]
+        )
+        result = lead_handoff_preview(voices)
+        self.assertEqual(self.leaders(result), ["a", "a", "c"])
+        self.assertEqual(result["handoff_count"], 1)
+
+    def test_continuation_across_own_event_boundary_is_not_a_handoff(self):
+        # a sounds the whole measure as two adjacent sound events (its own
+        # boundary at 1/2); b joins for the second half. a leading both
+        # halves is zero handoffs even though the reported event id changes.
+        voices = make_voices(
+            [
+                ("a", [(KIND_SOUND, "1/2"), (KIND_SOUND, "1/2")]),
+                ("b", [(KIND_REST, "1/2"), (KIND_SOUND, "1/2")]),
+            ]
+        )
+        result = lead_handoff_preview(voices)
+        self.assertEqual(self.leaders(result), ["a", "a"])
+        self.assertEqual(
+            [segment["event_id"] for segment in result["segments"]],
+            ["v1e1", "v1e2"],
+        )
+        self.assertEqual(result["handoff_count"], 0)
+
+    def test_wholly_resting_measure_has_one_null_segment(self):
+        voices = make_voices(
+            [
+                ("a", [(KIND_REST, "1")]),
+                ("b", [(KIND_REST, "1")]),
+            ]
+        )
+        result = lead_handoff_preview(voices)
+        self.assertEqual(result["handoff_count"], 0)
+        self.assertEqual(len(result["segments"]), 1)
+        self.assertIsNone(result["segments"][0]["leader"])
+        self.assertIsNone(result["segments"][0]["event_id"])
+        self.assertEqual(
+            (result["segments"][0]["start"], result["segments"][0]["end"]),
+            (Fraction(0), Fraction(1)),
+        )
+
+    def test_two_rest_segments_split_two_independent_relays(self):
+        # a ends at 1/4, b starts at 3/4; a third voice rests through the
+        # measure with a boundary at 1/2, so the gap splits into two
+        # adjacent rest segments. Either leader choice across the gap is
+        # free, so total handoffs are zero.
+        voices = make_voices(
+            [
+                ("a", [(KIND_SOUND, "1/4"), (KIND_REST, "3/4")]),
+                ("b", [(KIND_REST, "3/4"), (KIND_SOUND, "1/4")]),
+                ("c", [(KIND_REST, "1/2"), (KIND_REST, "1/2")]),
+            ]
+        )
+        result = lead_handoff_preview(voices)
+        self.assertEqual(self.leaders(result), ["a", None, None, "b"])
+        self.assertEqual(result["handoff_count"], 0)
 
 
 class ParsePositiveDecimalTest(unittest.TestCase):

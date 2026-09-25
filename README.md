@@ -429,6 +429,81 @@ curl -s -X POST http://localhost:8000/measures/1/time-preview \
 }
 ```
 
+### `POST /measures/{id}/lead-handoff-preview` — 领奏接力预览（只读，不写库）
+
+在节拍网格（所有事件边界并集切出的半开段 `[start, end)`，与 `GET /measures/{id}/grid`
+完全相同）上为每段选一位**领奏声部**，用于预览整小节的领奏接力：
+
+- **有声段**（至少一个声部正在发声）必须从该段**正在发声的声部**中选一位领奏者；
+- **全休止段**（所有声部都休止）领奏为 `null`（`event_id` 也为 `null`），并且
+  **打断接力**——其后第一个有声段相当于接力重新开始；
+- 相邻两个有声段的领奏声部不同，计一次**换手**；领奏相同（即使该声部的事件已换成
+  另一个事件 ID）不计换手；**跨全休止段不计换手**。
+
+服务在所有合法领奏方案中使**整小节换手总数最少**；换手总数相同时，按声部的**存储顺序**
+比较**完整领奏序列**，取**字典序最小**者（越早的段越优先取存储顺序靠前的声部；全休止位置
+在每个方案中都是同样的 `null`，不参与平局比较）。全部运算使用 `fractions.Fraction`
+精确完成。
+
+- 请求**无请求体**（直接 POST），响应按网格段给出有理起止、领奏声部名及其**事件 ID**，
+  并给出 `handoff_count`（换手总数）。
+- 小节 ID 不存在返回 **404**；该接口为**只读预览，不写入数据库**。
+
+```bash
+curl -s -X POST http://localhost:8000/measures/1/lead-handoff-preview
+```
+
+例：小节时长 `1`，`melody` 在 `[0, 1/2)`、`[3/4, 1)` 发声，`bass` 在 `[1/4, 1)`
+发声。网格四段依次只有 melody、两者皆有、只有 bass、两者皆有；让 melody 领前两段、
+bass 领后两段只需在中间换手一次，为最少换手方案：
+
+```json
+{
+  "measure_id": 1,
+  "target_duration": "1",
+  "voices": ["melody", "bass"],
+  "handoff_count": 1,
+  "segments": [
+    {"start": "0",   "end": "1/4", "leader": "melody", "event_id": "v1e1"},
+    {"start": "1/4", "end": "1/2", "leader": "melody", "event_id": "v1e1"},
+    {"start": "1/2", "end": "3/4", "leader": "bass",   "event_id": "v2e2"},
+    {"start": "3/4", "end": "1",   "leader": "bass",   "event_id": "v2e2"}
+  ]
+}
+```
+
+全休止段打断接力的例子：`a` 只在 `[0, 1/3)` 发声、`b` 只在 `[2/3, 1)` 发声，中间
+`[1/3, 2/3)` 所有人休止。中段返回 `null` 并打断接力，因此 b 在休止后接过领奏**不计
+换手**，`handoff_count` 为 `0`：
+
+```json
+{
+  "measure_id": 2,
+  "target_duration": "1",
+  "voices": ["a", "b"],
+  "handoff_count": 0,
+  "segments": [
+    {"start": "0",   "end": "1/3", "leader": "a", "event_id": "v1e1"},
+    {"start": "1/3", "end": "2/3", "leader": null, "event_id": null},
+    {"start": "2/3", "end": "1",   "leader": "b", "event_id": "v2e2"}
+  ]
+}
+```
+
+各字段含义：
+
+| 字段              | 说明                                                                 |
+| ----------------- | -------------------------------------------------------------------- |
+| `handoff_count`   | 整小节换手总数（最小化目标）；只统计相邻有声段之间的领奏声部变化     |
+| `segments[].leader`    | 该段领奏声部名；全休止段为 `null`（同时打断接力）                |
+| `segments[].event_id`  | 领奏声部在该段正在发声的事件 ID（与 `GET /measures/{id}` 一致）；全休止段为 `null` |
+
+小节不存在时：
+
+```json
+{"detail": "measure not found"}
+```
+
 > 在浏览器中打开 http://localhost:8000/ 可查看服务与接口清单，
 > http://localhost:8000/docs 为可直接发起请求的 Swagger UI。
 
@@ -445,7 +520,7 @@ python3 -m unittest discover -s tests -p 'test_grid.py'   # 仅核心逻辑（�
 
 ```
 app/
-  grid.py      # 核心逻辑：有理数解析、精确累加、边界并集切分网格、节奏等价匹配、循环对齐、等分刻度量化、双声部冲突静音（二分图最小权顶点覆盖）、速度段积分换算秒数（纯标准库）
+  grid.py      # 核心逻辑：有理数解析、精确累加、边界并集切分网格、节奏等价匹配、循环对齐、等分刻度量化、双声部冲突静音（二分图最小权顶点覆盖）、速度段积分换算秒数、领奏接力最省换手预览（纯标准库）
   db.py        # SQLite 连接、建表、读写（纯标准库）
   schemas.py   # Pydantic 请求/响应模型与校验
   main.py      # FastAPI 应用与路由（启动时初始化数据库）
